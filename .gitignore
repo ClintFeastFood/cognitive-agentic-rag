@@ -1,0 +1,7 @@
+node_modules
+.env
+pycache/
+.venv/
+.bolt/
+.chainlit/
+storage/
