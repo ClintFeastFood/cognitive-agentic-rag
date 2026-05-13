@@ -30,7 +30,7 @@ from retrieval import RetrievalEngine, RetrievalResult, RankedFragment
 logger = logging.getLogger(__name__)
 #Initialize the 70B DeepSeek-R1 cloud layer via my free Groq token
 Settings.llm = Groq(
-    model="deepseek-r1-distill-llama-70b",
+    model="llama-3.3-70b-versatile",
     api_key=os.environ.get("GROQ_API_KEY")
 )
 
@@ -198,56 +198,63 @@ async def on_message(message: cl.Message) -> None:
         return
 
     # Step 2: Build context and prompt the LLM.
-    context_block = _build_context_block(result.fragments)
-    full_prompt = f"{SYSTEM_PROMPT}\n\n--- CONTEXT ---\n{context_block}\n\n--- QUESTION ---\n{query}"
+    # --- FIXED COGNITIVE LLM GENERATION & INLINE CITATIONS STREAMING ---
+    # --- FIXED COGNITIVE LLM GENERATION & INLINE CITATIONS STREAMING ---
+    from llama_index.core.llms import ChatMessage
+    from llama_index.llms.groq import Groq
+    import os
 
-    # Step 3: Stream the LLM response token by token.
-    response_msg = cl.Message(content="")
-    await response_msg.send()
-
-    llm = Settings.llm
-    full_response: str = ""
-
-    # Use the LLM's streaming interface for token-by-token output.
-    try:
-        response_stream = await asyncio.to_thread(
-            llm.stream, full_prompt
-        )
-        for token in response_stream:
-            full_response += token
-            await response_msg.stream_token(token)
-    except Exception as exc:
-        logger.error("LLM streaming failed: %s", exc)
-        await response_msg.stream_token(
-            f"\n\n[Error generating response: {exc}]"
-        )
-
-    await response_msg.update()
-
-    # Step 4: Attach expandable citation cards for each context source.
-    for i, frag in enumerate(result.fragments, start=1):
-        source_label = frag.source_file or "uploaded document"
-        page_info = f" | Page: {frag.page_number}" if frag.page_number else ""
-        meta_label = (
-            f"Score: {frag.score:.4f} | Type: {frag.chunk_type}{page_info}"
-        )
-        citation = ClText(
-            name=f"Source [{i}] - {source_label}",
-            content=frag.text,
-            display="inline",
-        )
-        await citation.send()
-        # Append a compact reference line under the message.
-        await response_msg.stream_token(
-            f"\n> **[{i}]** {source_label} — {meta_label}"
-        )
-
-    intent_label = "Summary" if result.intent.value == "summary" else "Granular (Hybrid)"
-    await response_msg.stream_token(
-        f"\n\n_Retrieval path: {intent_label} | Fragments: {len(result.fragments)}_"
+    # Force a fresh, explicit Groq instance using your key environment string
+    local_groq_llm = Groq(
+        model="llama-3.3-70b-versatile",
+        api_key=os.environ.get("GROQ_API_KEY")
     )
-    await response_msg.update()
 
+    # 1. Structure your context nodes as standard ChatMessage layers
+    context_str = "\n\n".join([f"[Source {i+1}]: {frag.text}" for i, frag in enumerate(result.fragments)])
+    
+    system_instruction = (
+        "You are a precise, well-sourced enterprise research assistant. "
+        "Answer the user's question using ONLY the provided context fragments. "
+        "Cite sources inline as [Source 1], [Source 2], corresponding directly to the fragment index. "
+        "If the context does not contain enough information, say so explicitly. Do not extrapolate."
+    )
+
+    messages = [
+        ChatMessage(role="system", content=system_instruction),
+        ChatMessage(role="user", content=f"Context Sources:\n{context_str}\n\nQuery: {query}")
+    ]
+
+    # 2. Instantiate and transmit parent message frame
+    msg = cl.Message(content="")
+    await msg.send()
+
+    # 3. Stream response tokens cleanly from Groq cloud infrastructure using local_groq_llm
+    try:
+        response_stream = await local_groq_llm.astream_chat(messages)
+        async for chunk in response_stream:
+            if chunk.delta:
+                await msg.stream_token(chunk.delta)
+    except Exception as e:
+        logger.error(f"LLM streaming engine failed: {str(e)}")
+        msg.content = f"⚠️ Prompt optimization error: {str(e)}"
+        await msg.update()
+        return
+    
+    # 4. Build and attach inline citations safely underneath the text block
+    text_elements = []
+    for i, frag in enumerate(result.fragments):
+        source_label = f"Source {i+1}"
+        text_elements.append(
+            cl.Text(
+                name=source_label,
+                content=f"Structural Extraction Layer: {frag.chunk_type}\n\nData Passage Content:\n{frag.text}",
+                display="inline"
+            )
+        )
+    
+    msg.elements = text_elements
+    await msg.update()
 
 # ---------------------------------------------------------------------------
 # Chainlit entry point
